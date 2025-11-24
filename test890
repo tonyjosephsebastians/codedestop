@@ -1,0 +1,570 @@
+import os
+import threading
+import traceback
+import re
+import time
+import datetime
+import zipfile
+import tempfile
+import shutil
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+
+import pandas as pd
+from docx import Document as DocxDocument
+from pptx import Presentation
+from PyPDF2 import PdfReader
+
+# Optional: for legacy .doc
+try:
+    import textract
+    HAS_TEXTRACT = True
+except ImportError:
+    HAS_TEXTRACT = False
+
+
+# ---------- FILE TEXT EXTRACTORS ----------
+
+def get_text_from_docx(path):
+    doc = DocxDocument(path)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def get_text_from_txt(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def get_text_from_pdf(path):
+    text = []
+    with open(path, "rb") as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            try:
+                page_text = page.extract_text()
+                if page_text:
+                    text.append(page_text)
+            except Exception:
+                continue
+    return "\n".join(text)
+
+
+def get_text_from_xlsx(path):
+    xls = pd.ExcelFile(path)
+    texts = []
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name, dtype=str)
+        texts.append(df.to_string())
+    return "\n".join(texts)
+
+
+def get_text_from_xls(path):
+    xls = pd.ExcelFile(path)
+    texts = []
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name, dtype=str)
+        texts.append(df.to_string())
+    return "\n".join(texts)
+
+
+def get_text_from_pptx(path):
+    prs = Presentation(path)
+    texts = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                texts.append(shape.text)
+    return "\n".join(texts)
+
+
+def get_text_from_doc(path):
+    if not HAS_TEXTRACT:
+        raise RuntimeError(
+            ".doc support requires 'textract' package. Install with: pip install textract"
+        )
+    text = textract.process(path)
+    try:
+        return text.decode("utf-8", errors="ignore")
+    except Exception:
+        return str(text)
+
+
+def extract_text(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".txt":
+        return get_text_from_txt(path)
+    elif ext == ".docx":
+        return get_text_from_docx(path)
+    elif ext == ".pdf":
+        return get_text_from_pdf(path)
+    elif ext == ".xlsx":
+        return get_text_from_xlsx(path)
+    elif ext == ".xls":
+        return get_text_from_xls(path)
+    elif ext == ".pptx":
+        return get_text_from_pptx(path)
+    elif ext == ".doc":
+        return get_text_from_doc(path)
+    else:
+        raise ValueError(f"Unsupported extension: {ext}")
+
+
+# ---------- KEYWORD MAPPING ----------
+
+def load_keyword_mapping(excel_path):
+    """
+    Excel format:
+        Heading | Keywords
+        BSL     | Basel, BSL
+
+    Returns:
+        { "BSL": ["basel", "bsl"], ... }  (lowercased for case-insensitive search)
+    """
+    df = pd.read_excel(excel_path)
+    if "Heading" not in df.columns or "Keywords" not in df.columns:
+        raise ValueError("Mapping file must have 'Heading' and 'Keywords' columns")
+
+    mapping = {}
+    for _, row in df.iterrows():
+        heading = str(row["Heading"]).strip()
+        if not heading or heading.lower() == "nan":
+            continue
+        kw_cell = str(row["Keywords"])
+        if not kw_cell or kw_cell.lower() == "nan":
+            continue
+        keywords = [k.strip() for k in re.split(r"[;,]", kw_cell) if k.strip()]
+        if not keywords:
+            continue
+        mapping[heading] = [k.lower() for k in keywords]
+
+    if not mapping:
+        raise ValueError("No valid headings/keywords found in mapping file.")
+    return mapping
+
+
+# ---------- ZIP HELPERS ----------
+
+def extract_zip_recursive(zip_path, temp_root):
+    """
+    Extracts a zip file into a temp directory and returns the extracted root folder.
+    """
+    name = os.path.splitext(os.path.basename(zip_path))[0]
+    extract_dir = os.path.join(temp_root, name)
+
+    try:
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extractall(extract_dir)
+    except Exception:
+        return None
+
+    return extract_dir
+
+
+def count_files_in_zip(zip_path, exts):
+    """Count files inside a ZIP that match the target extensions."""
+    count = 0
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            for name in z.namelist():
+                if name.endswith("/"):
+                    continue
+                zext = os.path.splitext(name)[1].lower()
+                if zext in exts:
+                    count += 1
+    except Exception:
+        # If zip is corrupted, just ignore for counting; it will be logged in processing.
+        pass
+    return count
+
+
+# ---------- MAIN APP ----------
+
+class DocsSearchApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Docs Search Tool")
+
+        # Store (folder, mapping_path, mapping_dict) entries
+        self.tasks = []
+
+        self.selected_formats = {
+            ".docx": tk.BooleanVar(value=True),
+            ".doc": tk.BooleanVar(value=False),
+            ".xlsx": tk.BooleanVar(value=True),
+            ".xls": tk.BooleanVar(value=False),
+            ".pptx": tk.BooleanVar(value=False),
+            ".pdf": tk.BooleanVar(value=True),
+            ".txt": tk.BooleanVar(value=True),
+        }
+
+        self.output_path = None
+        self.total_files = 0
+        self.processed_files = 0
+        self.start_time = None
+
+        self.log_file = None
+        self.log_path = None
+
+        self._build_ui()
+
+    # ----- UI -----
+
+    def _build_ui(self):
+        frm_top = ttk.LabelFrame(self, text="Select file formats to search:")
+        frm_top.pack(fill="x", padx=10, pady=10)
+
+        for ext, var in self.selected_formats.items():
+            ttk.Checkbutton(frm_top, text=ext, variable=var).pack(
+                side="left", padx=5, pady=5
+            )
+
+        frm_mid = ttk.Frame(self)
+        frm_mid.pack(fill="x", padx=10, pady=5)
+
+        self.btn_add = ttk.Button(
+            frm_mid, text="Add Folder & Keywords", command=self.add_folder_and_keywords
+        )
+        self.btn_add.pack(side="left", padx=5)
+
+        self.btn_search = ttk.Button(frm_mid, text="Search", command=self.start_search)
+        self.btn_search.pack(side="left", padx=5)
+
+        self.btn_open = ttk.Button(
+            frm_mid, text="Open Output File", command=self.open_output_file
+        )
+        self.btn_open.pack(side="left", padx=5)
+
+        # Listbox for tasks
+        self.tasks_list = ScrolledText(self, height=5)
+        self.tasks_list.pack(fill="both", expand=False, padx=10, pady=5)
+        self.tasks_list.insert("end", "No folder/keyword mapping added yet.\n")
+        self.tasks_list.configure(state="disabled")
+
+        # Progress bar
+        frm_prog = ttk.Frame(self)
+        frm_prog.pack(fill="x", padx=10, pady=5)
+
+        self.progress = ttk.Progressbar(
+            frm_prog, orient="horizontal", mode="determinate"
+        )
+        self.progress.pack(fill="x", expand=True, side="left", padx=5)
+
+        self.lbl_status = ttk.Label(frm_prog, text="0 / 0 files processed | ETA: --:--")
+        self.lbl_status.pack(side="left", padx=5)
+
+        # Log
+        lbl_log = ttk.Label(self, text="Log:")
+        lbl_log.pack(anchor="w", padx=10)
+
+        self.log_box = ScrolledText(self, height=15)
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
+
+    # ----- Helpers -----
+
+    def create_log_file(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        log_dir = os.path.join(script_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = os.path.join(log_dir, f"log_{ts}.txt")
+        self.log_file = open(self.log_path, "a", encoding="utf-8", errors="ignore")
+        self.log(f"Log file created at: {self.log_path}")
+
+    def close_log_file(self):
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
+
+    def log(self, msg):
+        # GUI log
+        self.log_box.insert("end", msg + "\n")
+        self.log_box.see("end")
+        self.update_idletasks()
+
+        # File log
+        if self.log_file:
+            try:
+                self.log_file.write(msg + "\n")
+                self.log_file.flush()
+            except Exception:
+                pass
+
+    def update_tasks_display(self):
+        self.tasks_list.configure(state="normal")
+        self.tasks_list.delete("1.0", "end")
+        if not self.tasks:
+            self.tasks_list.insert("end", "No folder/keyword mapping added yet.\n")
+        else:
+            for i, t in enumerate(self.tasks, start=1):
+                self.tasks_list.insert(
+                    "end",
+                    f"{i}. Folder: {t['folder']} | Mapping: {t['mapping_path']}\n",
+                )
+        self.tasks_list.configure(state="disabled")
+
+    def format_eta(self):
+        if not self.start_time or self.processed_files == 0:
+            return "--:--"
+        elapsed = time.time() - self.start_time
+        avg_per_file = elapsed / max(self.processed_files, 1)
+        remaining = max(self.total_files - self.processed_files, 0)
+        eta_seconds = int(avg_per_file * remaining)
+        if eta_seconds >= 3600:
+            h = eta_seconds // 3600
+            m = (eta_seconds % 3600) // 60
+            return f"{h:02d}:{m:02d}h"
+        else:
+            m = eta_seconds // 60
+            s = eta_seconds % 60
+            return f"{m:02d}:{s:02d}"
+
+    # ----- Button actions -----
+
+    def add_folder_and_keywords(self):
+        folder = filedialog.askdirectory(title="Select folder to search")
+        if not folder:
+            return
+
+        mapping_path = filedialog.askopenfilename(
+            title="Select keyword mapping Excel",
+            filetypes=[("Excel files", "*.xlsx *.xls")],
+        )
+        if not mapping_path:
+            return
+
+        try:
+            mapping = load_keyword_mapping(mapping_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load mapping file:\n{e}")
+            return
+
+        self.tasks.append(
+            {
+                "folder": folder,
+                "mapping_path": mapping_path,
+                "mapping": mapping,
+            }
+        )
+        self.update_tasks_display()
+        self.log(f"Added task: folder='{folder}', mapping='{mapping_path}'")
+
+    def start_search(self):
+        if not self.tasks:
+            messagebox.showwarning("No tasks", "Please add at least one folder + mapping.")
+            return
+
+        exts = [ext for ext, var in self.selected_formats.items() if var.get()]
+        if not exts:
+            messagebox.showwarning(
+                "No formats", "Please select at least one file format to search."
+            )
+            return
+
+        # Choose output file
+        self.output_path = filedialog.asksaveasfilename(
+            title="Save output Excel as...",
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")],
+            initialfile="search_results.xlsx",
+        )
+        if not self.output_path:
+            return
+
+        t = threading.Thread(target=self.run_search, args=(exts,), daemon=True)
+        t.start()
+
+    def open_output_file(self):
+        if self.output_path and os.path.isfile(self.output_path):
+            try:
+                os.startfile(self.output_path)  # Windows
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open file:\n{e}")
+        else:
+            messagebox.showinfo("Info", "No output file yet. Run a search first.")
+
+    # ----- Core search logic -----
+
+    def process_file(self, full_path, fname, rel_folder, mapping, results_rows):
+        try:
+            text = extract_text(full_path)
+            text_lower = text.lower()
+            heading_values = {}
+
+            for heading, keywords in mapping.items():
+                found = []
+                for kw in keywords:
+                    if kw in text_lower:
+                        found.append(kw)
+                if found:
+                    heading_values[heading] = ", ".join(sorted(set(found)))
+                else:
+                    heading_values[heading] = "No Keywords Found"
+
+            row = {
+                "Document Name": fname,
+                "Folder": rel_folder,
+            }
+            row.update(heading_values)
+            results_rows.append(row)
+
+            self.log(f"OK: {full_path}")
+
+        except Exception as e:
+            self.log(f"ERROR in {full_path}: {e}")
+            self.log(traceback.format_exc())
+
+        finally:
+            self.processed_files += 1
+            self.progress["value"] = self.processed_files
+            eta_str = self.format_eta()
+            self.lbl_status.config(
+                text=f"{self.processed_files} / {self.total_files} files processed | ETA: {eta_str}"
+            )
+            self.update_idletasks()
+
+    def save_partial_results(self, results_rows, all_headings):
+        """Save current results to Excel so progress isn't lost."""
+        if not results_rows:
+            return
+
+        all_headings_sorted = sorted(all_headings)
+        columns = ["Document Name", "Folder"] + all_headings_sorted
+
+        normalized = []
+        for row in results_rows:
+            base = {col: "" for col in columns}
+            base.update(row)
+            normalized.append(base)
+
+        df_out = pd.DataFrame(normalized, columns=columns)
+        df_out.to_excel(self.output_path, index=False)
+        self.log(f"Partial results saved to: {self.output_path}")
+
+    def count_total_files(self, exts):
+        """Count all files to process (including inside zips)."""
+        self.total_files = 0
+        for task in self.tasks:
+            folder = task["folder"]
+            for root, _, files in os.walk(folder):
+                for fname in files:
+                    full_path = os.path.join(root, fname)
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in exts:
+                        self.total_files += 1
+                    elif ext == ".zip":
+                        self.total_files += count_files_in_zip(full_path, exts)
+
+    def run_search(self, exts):
+        temp_root = None
+        all_headings = set()
+        results_rows = []
+
+        try:
+            self.btn_search.config(state="disabled")
+            self.btn_add.config(state="disabled")
+            self.processed_files = 0
+            self.progress["value"] = 0
+            self.log_box.delete("1.0", "end")
+            self.lbl_status.config(text="0 / 0 files processed | ETA: --:--")
+
+            self.create_log_file()
+            self.log("Starting search...")
+
+            # 1. Count total files first (including contents of zips)
+            self.log("Counting files (this may take a while)...")
+            self.count_total_files(exts)
+
+            if self.total_files == 0:
+                self.log("No files found with selected formats.")
+                self.lbl_status.config(text="0 / 0 files processed | ETA: --:--")
+                return
+
+            self.progress["maximum"] = self.total_files
+            self.lbl_status.config(
+                text=f"0 / {self.total_files} files processed | ETA: --:--"
+            )
+            self.log(f"Total files to process (including inside ZIPs): {self.total_files}")
+
+            self.start_time = time.time()
+
+            temp_root = tempfile.mkdtemp(prefix="docs_search_zip_")
+            self.log(f"Temporary extraction root: {temp_root}")
+
+            # 2. Process each task (folder + mapping)
+            for task in self.tasks:
+                folder = task["folder"]
+                mapping = task["mapping"]
+                headings = list(mapping.keys())
+                for h in headings:
+                    all_headings.add(h)
+
+                self.log(f"\nProcessing folder: {folder}")
+
+                for root, _, files in os.walk(folder):
+                    for fname in files:
+                        full_path = os.path.join(root, fname)
+                        ext = os.path.splitext(fname)[1].lower()
+
+                        # ZIP handling
+                        if ext == ".zip":
+                            self.log(f"Extracting ZIP: {full_path}")
+                            extracted_dir = extract_zip_recursive(full_path, temp_root)
+                            if extracted_dir:
+                                for eroot, _, efiles in os.walk(extracted_dir):
+                                    for efname in efiles:
+                                        eext = os.path.splitext(efname)[1].lower()
+                                        if eext not in exts:
+                                            continue
+                                        extracted_path = os.path.join(eroot, efname)
+                                        rel_folder = os.path.relpath(eroot, folder)
+                                        self.process_file(
+                                            extracted_path,
+                                            efname,
+                                            rel_folder,
+                                            mapping,
+                                            results_rows,
+                                        )
+                            else:
+                                self.log(f"Failed to extract ZIP: {full_path}")
+                            continue
+
+                        # Normal file
+                        if ext not in exts:
+                            continue
+
+                        rel_folder = os.path.relpath(root, folder)
+                        self.process_file(
+                            full_path, fname, rel_folder, mapping, results_rows
+                        )
+
+                # After finishing each folder, save partial results
+                self.save_partial_results(results_rows, all_headings)
+
+            # 3. Final save (in case last folder added new headings)
+            self.save_partial_results(results_rows, all_headings)
+
+            self.log("\nSearch completed.")
+            self.log(f"Final results saved to: {self.output_path}")
+            self.log(f"Full log saved to: {self.log_path}")
+            messagebox.showinfo(
+                "Done",
+                f"Search completed.\n\nResults: {self.output_path}\nLog: {self.log_path}",
+            )
+
+        finally:
+            if temp_root:
+                shutil.rmtree(temp_root, ignore_errors=True)
+            self.close_log_file()
+            self.btn_search.config(state="normal")
+            self.btn_add.config(state="normal")
+
+
+if __name__ == "__main__":
+    app = DocsSearchApp()
+    app.mainloop()
