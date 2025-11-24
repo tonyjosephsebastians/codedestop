@@ -1,0 +1,1 @@
+pip install python-docx openpyxl xlrd python-pptx PyPDF2 pandas textract
